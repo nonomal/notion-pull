@@ -5,11 +5,23 @@
   },
   "cSpell.words": [
     "callouts",
+    "DOCU_NOTION",
+    "docu-notion",
+    "docunotion",
+    "Greenshot",
+    "imgur",
+    "kanban",
+    "sillsdev",
     "unlocalized"
   ],
   "workbench.colorCustomizations": {
     "statusBar.background": "#d649ca",
     "statusBar.noFolderBackground": "#d649ca",
     "statussBar.prominentBackground": "#d649ca"
+  },
+  "markdownlint.config": {
+    "MD025":false,
+    "MD033":false,
+    "MD040":false
   }
 }
