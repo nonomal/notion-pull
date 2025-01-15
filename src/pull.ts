@@ -3,22 +3,36 @@ import * as fs from "fs-extra";
 import { NotionToMarkdown } from "notion-to-md";
 import { HierarchicalNamedLayoutStrategy } from "./HierarchicalNamedLayoutStrategy";
 import { LayoutStrategy } from "./LayoutStrategy";
-import { initNotionClient, NotionPage, PageType } from "./NotionPage";
-import {
-  initImageHandling,
-  cleanupOldImages,
-  markdownToMDImageTransformer,
-} from "./images";
+import { NotionPage, PageType } from "./NotionPage";
+import { initImageHandling, cleanupOldImages } from "./images";
 
-import { tweakForDocusaurus } from "./DocusaurusTweaks";
-import { setupCustomTransformers } from "./transformers/CustomTransformers";
 import * as Path from "path";
-import { error, heading, info, logDebug, verbose, warning } from "./log";
-import { convertInternalLinks } from "./links";
-import { ListBlockChildrenResponseResult } from "notion-to-md/build/types";
-import chalk from "chalk";
+import {
+  endGroup,
+  error,
+  group,
+  info,
+  logDebug,
+  verbose,
+  warning,
+} from "./log";
+import { IDocuNotionContext } from "./plugins/pluginTypes";
+import { getMarkdownForPage } from "./transform";
+import {
+  BlockObjectResponse,
+  GetPageResponse,
+  ListBlockChildrenResponse,
+} from "@notionhq/client/build/src/api-endpoints";
+import { RateLimiter } from "limiter";
+import { Client, isFullBlock } from "@notionhq/client";
+import { exit } from "process";
+import { IDocuNotionConfig, loadConfigAsync } from "./config/configuration";
+import { NotionBlock } from "./types";
+import { convertInternalUrl } from "./plugins/internalLinks";
+import { ListBlockChildrenResponseResults } from "notion-to-md/build/types";
 
-export type Options = {
+type ImageFileNameFormat = "default" | "content-hash" | "legacy";
+export type DocuNotionOptions = {
   notionToken: string;
   rootPage: string;
   locales: string[];
@@ -26,9 +40,10 @@ export type Options = {
   imgOutputPath: string;
   imgPrefixInMarkdown: string;
   statusTag: string;
+  requireSlugs?: boolean;
+  imageFileNameFormat?: ImageFileNameFormat;
 };
 
-let options: Options;
 let layoutStrategy: LayoutStrategy;
 let notionToMarkdown: NotionToMarkdown;
 const pages = new Array<NotionPage>();
@@ -37,19 +52,20 @@ const counts = {
   skipped_because_empty: 0,
   skipped_because_status: 0,
   skipped_because_level_cannot_have_content: 0,
+  error_because_no_slug: 0,
 };
 
-export async function notionPull(incomingOptions: Options): Promise<void> {
-  options = incomingOptions;
-
+export async function notionPull(options: DocuNotionOptions): Promise<void> {
   // It's helpful when troubleshooting CI secrets and environment variables to see what options actually made it to docu-notion.
   // eslint-disable-next-line @typescript-eslint/no-unsafe-call
-  const optionsForLogging = { ...incomingOptions };
+  const optionsForLogging = { ...options };
   // Just show the first few letters of the notion token, which start with "secret" anyhow.
   optionsForLogging.notionToken =
-    optionsForLogging.notionToken.substring(0, 3) + "...";
+    optionsForLogging.notionToken.substring(0, 10) + "...";
 
-  verbose(JSON.stringify(optionsForLogging, null, 2));
+  const config = await loadConfigAsync();
+
+  verbose(`Options:${JSON.stringify(optionsForLogging, null, 2)}`);
   await initImageHandling(
     options.imgPrefixInMarkdown || options.imgOutputPath || "",
     options.imgOutputPath || "",
@@ -58,7 +74,7 @@ export async function notionPull(incomingOptions: Options): Promise<void> {
 
   const notionClient = initNotionClient(options.notionToken);
   notionToMarkdown = new NotionToMarkdown({ notionClient });
-  setupCustomTransformers(notionToMarkdown, notionClient);
+
   layoutStrategy = new HierarchicalNamedLayoutStrategy();
 
   await fs.mkdir(options.markdownOutputPath, { recursive: true });
@@ -68,29 +84,103 @@ export async function notionPull(incomingOptions: Options): Promise<void> {
 
   info("Connecting to Notion...");
 
-  heading(
+  // Do a  quick test to see if we can connect to the root so that we can give a better error than just a generic "could not find page" one.
+  try {
+    await executeWithRateLimitAndRetries("retrieving root page", async () => {
+      await notionClient.pages.retrieve({ page_id: options.rootPage });
+    });
+  } catch (e: any) {
+    error(
+      `docu-notion could not retrieve the root page from Notion. \r\na) Check that the root page id really is "${
+        options.rootPage
+      }".\r\nb) Check that your Notion API token (the "Integration Secret") is correct. It starts with "${
+        optionsForLogging.notionToken
+      }".\r\nc) Check that your root page includes your "integration" in its "connections".\r\nThis internal error message may help:\r\n    ${
+        e.message as string
+      }`
+    );
+    exit(1);
+  }
+
+  group(
     "Stage 1: walk children of the page named 'Outline', looking for pages..."
   );
-  await getPagesRecursively("", options.rootPage, 0, true);
+  await getPagesRecursively(options, "", options.rootPage, 0, true);
   logDebug("getPagesRecursively", JSON.stringify(pages, null, 2));
   info(`Found ${pages.length} pages`);
-  info(``);
-  heading(
+  endGroup();
+  group(
     `Stage 2: convert ${pages.length} Notion pages to markdown and save locally...`
   );
-  await outputPages(pages);
-  info(`Finished processing ${pages.length} pages`);
-  info(JSON.stringify(counts));
-  info(``);
-  heading("Stage 3: clean up old files & images...");
+  await outputPages(options, config, pages);
+  endGroup();
+  group("Stage 3: clean up old files & images...");
   await layoutStrategy.cleanupOldFiles();
   await cleanupOldImages();
+  endGroup();
 }
 
-async function outputPages(pages: Array<NotionPage>) {
+async function outputPages(
+  options: DocuNotionOptions,
+  config: IDocuNotionConfig,
+  pages: Array<NotionPage>
+) {
+  const context: IDocuNotionContext = {
+    getBlockChildren: getBlockChildren,
+    // this changes with each page
+    pageInfo: {
+      directoryContainingMarkdown: "",
+      relativeFilePathToFolderContainingPage: "",
+      slug: "",
+    },
+    layoutStrategy: layoutStrategy,
+    notionToMarkdown: notionToMarkdown,
+    options: options,
+    pages: pages,
+    counts: counts, // review will this get copied or pointed to?
+    imports: [],
+    convertNotionLinkToLocalDocusaurusLink: (url: string) =>
+      convertInternalUrl(context, url),
+  };
   for (const page of pages) {
-    await outputPage(page);
+    layoutStrategy.pageWasSeen(page);
+    const mdPath = layoutStrategy.getPathForPage(page, ".md");
+
+    // most plugins should not write to disk, but those handling image files need these paths
+    context.pageInfo.directoryContainingMarkdown = Path.dirname(mdPath);
+    // TODO: This needs clarifying: getLinkPathForPage() is about urls, but
+    // downstream images.ts is using it as a file system path
+    context.pageInfo.relativeFilePathToFolderContainingPage = Path.dirname(
+      layoutStrategy.getLinkPathForPage(page)
+    );
+    context.pageInfo.slug = page.slug;
+
+    if (
+      page.type === PageType.DatabasePage &&
+      context.options.statusTag != "*" &&
+      page.status !== context.options.statusTag
+    ) {
+      verbose(
+        `Skipping page because status is not '${context.options.statusTag}': ${page.nameOrTitle}`
+      );
+      ++context.counts.skipped_because_status;
+    } else {
+      if (options.requireSlugs && !page.hasExplicitSlug) {
+        error(
+          `Page "${page.nameOrTitle}" is missing a required slug. (--require-slugs is set.)`
+        );
+        ++counts.error_because_no_slug;
+      }
+
+      const markdown = await getMarkdownForPage(config, context, page);
+      writePage(page, markdown);
+    }
   }
+
+  if (counts.error_because_no_slug > 0) exit(1);
+
+  info(`Finished processing ${pages.length} pages`);
+  info(JSON.stringify(counts));
 }
 
 // This walks the "Outline" page and creates a list of all the nodes that will
@@ -100,12 +190,13 @@ async function outputPages(pages: Array<NotionPage>) {
 // then step through this list creating the files we need, and, crucially, be
 // able to figure out what the url will be for any links between content pages.
 async function getPagesRecursively(
+  options: DocuNotionOptions,
   incomingContext: string,
   pageIdOfThisParent: string,
   orderOfThisParent: number,
   rootLevel: boolean
 ) {
-  const pageInTheOutline = await NotionPage.fromPageId(
+  const pageInTheOutline = await fromPageId(
     incomingContext,
     pageIdOfThisParent,
     orderOfThisParent,
@@ -116,7 +207,8 @@ async function getPagesRecursively(
     `Looking for children and links from ${incomingContext}/${pageInTheOutline.nameOrTitle}`
   );
 
-  const pageInfo = await pageInTheOutline.getContentInfo();
+  const r = await getBlockChildren(pageInTheOutline.pageId);
+  const pageInfo = await pageInTheOutline.getContentInfo(r);
 
   if (
     !rootLevel &&
@@ -124,7 +216,7 @@ async function getPagesRecursively(
     pageInfo.childPageIdsAndOrder.length
   ) {
     error(
-      `Skipping "${pageInTheOutline.nameOrTitle}"  and its children. docu-notion does not support pages that are both levels and have content at the same time.`
+      `Skipping "${pageInTheOutline.nameOrTitle}"  and its children. docu-notion does not support pages that are both levels and have text content (paragraphs) at the same time. Normally outline pages should just be composed of 1) links to other pages and 2) child pages (other levels of the outline). Note that @-mention style links appear as text paragraphs to docu-notion so must not be used to form the outline.`
     );
     ++counts.skipped_because_level_cannot_have_content;
     return;
@@ -147,10 +239,10 @@ async function getPagesRecursively(
     pageInfo.childPageIdsAndOrder.length ||
     pageInfo.linksPageIdsAndOrder.length
   ) {
-    let context = incomingContext;
+    let layoutContext = incomingContext;
     // don't make a level for "Outline" page at the root
     if (!rootLevel && pageInTheOutline.nameOrTitle !== "Outline") {
-      context = layoutStrategy.newLevel(
+      layoutContext = layoutStrategy.newLevel(
         options.markdownOutputPath,
         pageInTheOutline.order,
         incomingContext,
@@ -159,7 +251,8 @@ async function getPagesRecursively(
     }
     for (const childPageInfo of pageInfo.childPageIdsAndOrder) {
       await getPagesRecursively(
-        context,
+        options,
+        layoutContext,
         childPageInfo.id,
         childPageInfo.order,
         false
@@ -168,8 +261,8 @@ async function getPagesRecursively(
 
     for (const linkPageInfo of pageInfo.linksPageIdsAndOrder) {
       pages.push(
-        await NotionPage.fromPageId(
-          context,
+        await fromPageId(
+          layoutContext,
           linkPageInfo.id,
           linkPageInfo.order,
           false
@@ -186,120 +279,152 @@ async function getPagesRecursively(
   }
 }
 
-async function outputPage(page: NotionPage) {
-  if (
-    page.type === PageType.DatabasePage &&
-    options.statusTag != "*" &&
-    page.status !== options.statusTag
-  ) {
-    verbose(
-      `Skipping page because status is not '${options.statusTag}': ${page.nameOrTitle}`
-    );
-    ++counts.skipped_because_status;
-    return;
-  }
-
-  info(
-    `Reading & converting page ${page.context}/${
-      page.nameOrTitle
-    } (${chalk.blue(
-      page.hasExplicitSlug
-        ? page.slug
-        : page.foundDirectlyInOutline
-        ? "Descendant of Outline, not Database"
-        : "NO SLUG"
-    )})`
-  );
-  layoutStrategy.pageWasSeen(page);
-
+function writePage(page: NotionPage, finalMarkdown: string) {
   const mdPath = layoutStrategy.getPathForPage(page, ".md");
-  const directoryContainingMarkdown = Path.dirname(mdPath);
-
-  const blocks = (await page.getBlockChildren()).results;
-
-  const relativePathToFolderContainingPage = Path.dirname(
-    layoutStrategy.getLinkPathForPage(page)
-  );
-  logDebug("pull", JSON.stringify(blocks));
-
-  // we have to set this one up for each page because we need to
-  // give it two extra parameters that are context for each page
-  notionToMarkdown.setCustomTransformer(
-    "image",
-    (block: ListBlockChildrenResponseResult) =>
-      markdownToMDImageTransformer(
-        block,
-        directoryContainingMarkdown,
-        relativePathToFolderContainingPage
-      )
-  );
-
-  for (const block_t of blocks) {
-    const block = block_t as any;
-
-    escapeHtml(block);
-
-    // One half of a horrible hack to make heading links work.
-    // See the other half and explanation in CustomTransformers.ts => headingCustomTransformer.
-    if (block.type.startsWith("heading"))
-      block.type = block.type.replace("heading", "my_heading");
-  }
-
-  const mdBlocks = await notionToMarkdown.blocksToMarkdown(blocks);
-
-  // if (page.nameOrTitle.startsWith("Embed")) {
-  //   console.log(JSON.stringify(blocks, null, 2));
-  //   console.log(JSON.stringify(mdBlocks, null, 2));
-  // }
-  let frontmatter = "---\n";
-  frontmatter += `title: ${page.nameOrTitle.replaceAll(":", "-")}\n`; // I have not found a way to escape colons
-  frontmatter += `sidebar_position: ${page.order}\n`;
-  frontmatter += `slug: ${page.slug ?? ""}\n`;
-  if (page.keywords) frontmatter += `keywords: [${page.keywords}]\n`;
-
-  frontmatter += "---\n";
-
-  let markdown = notionToMarkdown.toMarkdownString(mdBlocks);
-
-  // Improve: maybe this could be another markdown-to-md "custom transformer"
-  markdown = convertInternalLinks(markdown, pages, layoutStrategy);
-
-  // Improve: maybe this could be another markdown-to-md "custom transformer"
-  const { body, imports } = tweakForDocusaurus(markdown);
-  const output = `${frontmatter}\n${imports}\n${body}`;
   verbose(`writing ${mdPath}`);
-  fs.writeFileSync(mdPath, output, {});
-
+  fs.writeFileSync(mdPath, finalMarkdown, {});
   ++counts.output_normally;
 }
 
-function escapeHtml(block: any): void {
-  const blockContent = block[block.type];
+const notionLimiter = new RateLimiter({
+  tokensPerInterval: 3,
+  interval: "second",
+});
 
-  if (blockContent.rich_text?.length) {
-    for (let i = 0; i < blockContent.rich_text.length; i++) {
-      const rt = blockContent.rich_text[i];
+let notionClient: Client;
 
-      // See https://github.com/sillsdev/docu-notion/issues/21.
-      // For now, we just do a simple replace of < an > with &lt; and &gt;
-      // but only if the text will not be displayed as code.
-      // If it will be displayed as code,
-      // a) nothing will be trying to parse it, so it is safe.
-      // b) at no point does anything interpret the escaped character **back** to html;
-      //    so it will be displayed as "&lt;" or "&gt;".
-      // We may have to add more complex logic here in the future if we
-      // want to start letting html through which we **do** want to parse.
-      // For example, we could assume that text in a valid html structure should be parsed.
+async function getPageMetadata(id: string): Promise<GetPageResponse> {
+  return await executeWithRateLimitAndRetries(`pages.retrieve(${id})`, () => {
+    return notionClient.pages.retrieve({
+      page_id: id,
+    });
+  });
+}
+
+// While everything works fine locally, on Github Actions we are getting a lot of timeouts, so
+// we're trying this extra retry-able wrapper.
+export async function executeWithRateLimitAndRetries<T>(
+  label: string,
+  asyncFunction: () => Promise<T>
+): Promise<T> {
+  await rateLimit();
+  const kRetries = 10;
+  let lastException = undefined;
+  for (let i = 0; i < kRetries; i++) {
+    try {
+      return await asyncFunction();
+    } catch (e: any) {
+      lastException = e;
       if (
-        rt?.plain_text &&
-        block.type !== "code" &&
-        rt.type !== "code" &&
-        !rt.annotations?.code
+        e?.code === "notionhq_client_request_timeout" ||
+        e.message.includes("timeout") ||
+        e.message.includes("Timeout") ||
+        e.message.includes("limit") ||
+        e.message.includes("Limit") ||
+        e?.code === "notionhq_client_response_error" ||
+        e?.code === "service_unavailable"
       ) {
-        rt.plain_text = rt.plain_text
-          .replaceAll("<", "&lt;")
-          .replaceAll(">", "&gt;");
+        const secondsToWait = i + 1;
+        warning(
+          `While doing "${label}", got error "${
+            e.message as string
+          }". Will retry after ${secondsToWait}s...`
+        );
+        await new Promise(resolve => setTimeout(resolve, 1000 * secondsToWait));
+      } else {
+        throw e;
       }
+    }
+  }
+
+  error(`Error: could not complete "${label}" after ${kRetries} retries.`);
+  throw lastException;
+}
+
+async function rateLimit() {
+  if (notionLimiter.getTokensRemaining() < 1) {
+    logDebug("rateLimit", "*** delaying for rate limit");
+  }
+  await notionLimiter.removeTokens(1);
+}
+
+async function getBlockChildren(id: string): Promise<NotionBlock[]> {
+  // we can only get so many responses per call, so we set this to
+  // the first response we get, then keep adding to its array of blocks
+  // with each subsequent response
+  let overallResult: ListBlockChildrenResponse | undefined = undefined;
+  let start_cursor: string | undefined | null = undefined;
+
+  // Note: there is a now a collectPaginatedAPI() in the notion client, so
+  // we could switch to using that (I don't know if it does rate limiting?)
+  do {
+    const response: ListBlockChildrenResponse =
+      await executeWithRateLimitAndRetries(`getBlockChildren(${id})`, () => {
+        return notionClient.blocks.children.list({
+          start_cursor: start_cursor as string | undefined,
+          block_id: id,
+        });
+      });
+
+    if (!overallResult) {
+      overallResult = response;
+    } else {
+      overallResult.results.push(...response.results);
+    }
+
+    start_cursor = response?.next_cursor;
+  } while (start_cursor != null);
+
+  if (overallResult?.results?.some(b => !isFullBlock(b))) {
+    error(
+      `The Notion API returned some blocks that were not full blocks. docu-notion does not handle this yet. Please report it.`
+    );
+    exit(1);
+  }
+
+  const result = (overallResult?.results as BlockObjectResponse[]) ?? [];
+  numberChildrenIfNumberedList(result);
+  return result;
+}
+export function initNotionClient(notionToken: string): Client {
+  notionClient = new Client({
+    auth: notionToken,
+  });
+  return notionClient;
+}
+async function fromPageId(
+  context: string,
+  pageId: string,
+  order: number,
+  foundDirectlyInOutline: boolean
+): Promise<NotionPage> {
+  const metadata = await getPageMetadata(pageId);
+
+  //logDebug("notion metadata", JSON.stringify(metadata));
+  return new NotionPage({
+    layoutContext: context,
+    pageId,
+    order,
+    metadata,
+    foundDirectlyInOutline,
+  });
+}
+
+// This function is copied (and renamed from modifyNumberedListObject) from notion-to-md.
+// They always run it on the results of their getBlockChildren.
+// When we use our own getBlockChildren, we need to run it too.
+export function numberChildrenIfNumberedList(
+  blocks: ListBlockChildrenResponseResults
+): void {
+  let numberedListIndex = 0;
+
+  for (const block of blocks) {
+    if ("type" in block && block.type === "numbered_list_item") {
+      // add numbers
+      // @ts-ignore
+      block.numbered_list_item.number = ++numberedListIndex;
+    } else {
+      numberedListIndex = 0;
     }
   }
 }

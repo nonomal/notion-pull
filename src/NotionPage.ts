@@ -1,21 +1,8 @@
 /* eslint-disable @typescript-eslint/no-unsafe-return */
 /* eslint-disable @typescript-eslint/no-unsafe-call */
-import {
-  GetPageResponse,
-  ListBlockChildrenResponse,
-} from "@notionhq/client/build/src/api-endpoints";
-import { RateLimiter } from "limiter";
-import { Client } from "@notionhq/client";
-import { logDebug } from "./log";
-import { parseLinkId } from "./links";
-import { info } from "console";
-
-const notionLimiter = new RateLimiter({
-  tokensPerInterval: 3,
-  interval: "second",
-});
-
-let notionClient: Client;
+import { GetPageResponse } from "@notionhq/client/build/src/api-endpoints";
+import { parseLinkId } from "./plugins/internalLinks";
+import { ListBlockChildrenResponseResults } from "notion-to-md/build/types";
 
 // Notion has 2 kinds of pages: a normal one which is just content, and what I'm calling a "database page", which has whatever properties you put on it.
 // docu-notion supports the later via links from outline pages. That is, you put the database pages in a database, then separately, in the outline, you
@@ -25,54 +12,31 @@ export enum PageType {
   DatabasePage,
   Simple,
 }
-export function initNotionClient(notionToken: string): Client {
-  notionClient = new Client({
-    auth: notionToken,
-  });
-  return notionClient;
-}
 
 export class NotionPage {
-  private metadata: GetPageResponse;
-  public readonly pageId: string;
-  public readonly order: number;
-  public context: string; // where we found it in the hierarchy of the outline
+  public metadata: GetPageResponse;
+  public pageId: string;
+  public order: number;
+  public layoutContext: string; // where we found it in the hierarchy of the outline
   public foundDirectlyInOutline: boolean; // the page was found as a descendent of /outline instead of being linked to
 
-  private constructor(
-    context: string,
-    pageId: string,
-    order: number,
-    metadata: GetPageResponse,
-    foundDirectlyInOutline: boolean
-  ) {
-    this.context = context;
-    this.pageId = pageId;
-    this.order = order;
-    this.metadata = metadata;
-    this.foundDirectlyInOutline = foundDirectlyInOutline;
+  public constructor(args: {
+    layoutContext: string;
+    pageId: string;
+    order: number;
+    metadata: GetPageResponse;
+    foundDirectlyInOutline: boolean;
+  }) {
+    this.layoutContext = args.layoutContext;
+    this.pageId = args.pageId;
+    this.order = args.order;
+    this.metadata = args.metadata;
+    this.foundDirectlyInOutline = args.foundDirectlyInOutline;
 
     // review: this is expensive to learn as it takes another api call... I
     // think? We can tell if it's a database because it has a "Name" instead of a
     // "tile" and "parent": "type": "database_id". But do we need to differentiate
     //this.type = PageType.Unknown;
-  }
-  public static async fromPageId(
-    context: string,
-    pageId: string,
-    order: number,
-    foundDirectlyInOutline: boolean
-  ): Promise<NotionPage> {
-    const metadata = await getPageMetadata(pageId);
-
-    //logDebug("notion metadata", JSON.stringify(metadata));
-    return new NotionPage(
-      context,
-      pageId,
-      order,
-      metadata,
-      foundDirectlyInOutline
-    );
   }
 
   public matchesLinkId(id: string): boolean {
@@ -82,10 +46,10 @@ export class NotionPage {
       baseLinkId === this.pageId || // from a link_to_page.pageId, which still has the dashes
       baseLinkId === this.pageId.replaceAll("-", ""); // from inline links, which are lacking the dashes
 
-    logDebug(
-      `matchedLinkId`,
-      `comparing pageId:${this.pageId} to id ${id} --> ${match.toString()}`
-    );
+    // logDebug(
+    //   `matchedLinkId`,
+    //   `comparing pageId:${this.pageId} to id ${id} --> ${match.toString()}`
+    // );
     return match;
   }
 
@@ -133,7 +97,8 @@ export class NotionPage {
   private explicitSlug(): string | undefined {
     const explicitSlug = this.getPlainTextProperty("Slug", "");
     if (explicitSlug) {
-      if (explicitSlug === "/") return explicitSlug; // the root page
+      if (explicitSlug === "/") return explicitSlug;
+      // the root page
       else
         return (
           "/" +
@@ -172,14 +137,6 @@ export class NotionPage {
     return this.getSelectProperty("Status");
   }
 
-  private async getChildren(): Promise<ListBlockChildrenResponse> {
-    const children = await notionClient.blocks.children.list({
-      block_id: this.pageId,
-      page_size: 100, // max hundred links in a page
-    });
-    return children;
-  }
-
   public getPlainTextProperty(
     property: string,
     defaultIfEmpty: string
@@ -202,6 +159,10 @@ export class NotionPage {
           {
             ...
             "plain_text": "Intro",
+          },
+          {
+            ...
+            "plain_text": " to Notion",
           }
         ]
       */
@@ -214,7 +175,9 @@ export class NotionPage {
     const textArray = p[p.type];
     //console.log("textarray:" + JSON.stringify(textArray, null, 2));
     return textArray && textArray.length
-      ? (textArray[0].plain_text as string)
+      ? (textArray
+          .map((item: { plain_text: any }) => item.plain_text)
+          .join("") as string)
       : defaultIfEmpty;
   }
 
@@ -244,68 +207,60 @@ export class NotionPage {
     return p.select?.name || undefined;
   }
 
-  public async getBlockChildren(): Promise<ListBlockChildrenResponse> {
-    // we can only get so many responses per call, so we set this to
-    // the first response we get, then keep adding to its array of blocks
-    // with each subsequent response
-    let overallResult: ListBlockChildrenResponse | undefined = undefined;
-    let start_cursor = undefined;
-
-    do {
-      await rateLimit();
-
-      const response: ListBlockChildrenResponse =
-        await notionClient.blocks.children.list({
-          start_cursor: start_cursor,
-          block_id: this.pageId,
-        });
-      if (!overallResult) {
-        overallResult = response;
-      } else {
-        overallResult.results.push(...response.results);
+  public getDateProperty(
+    property: string,
+    defaultIfEmpty: string,
+    start = true
+  ): string {
+    /* Notion dates look like this
+   "properties": {
+      "published_date":
+      {
+        "id":"a%3Cql",
+        "type":"date",
+        "date":{
+          "start":"2021-10-24",
+          "end":null,
+          "time_zone":null
+        }
       }
+    }
+    */
 
-      start_cursor = response?.next_cursor;
-    } while (start_cursor != null);
-    return overallResult;
+    // console.log("metadata:\n" + JSON.stringify(this.metadata, null, 2));
+    const p = (this.metadata as any).properties?.[property];
+
+    // console.log(`prop ${property} = ${JSON.stringify(p)}`);
+    if (!p) return defaultIfEmpty;
+    if (start) {
+      return p?.date?.start ? (p.date.start as string) : defaultIfEmpty;
+    } else {
+      return p?.date?.end ? (p.date.end as string) : defaultIfEmpty;
+    }
   }
 
-  public async getContentInfo(): Promise<{
+  public async getContentInfo(
+    children: ListBlockChildrenResponseResults
+  ): Promise<{
     childPageIdsAndOrder: { id: string; order: number }[];
     linksPageIdsAndOrder: { id: string; order: number }[];
     hasParagraphs: boolean;
   }> {
-    const children = await this.getChildren();
-    for (let i = 0; i < children.results.length; i++) {
-      (children.results[i] as any).order = i;
+    for (let i = 0; i < children.length; i++) {
+      (children[i] as any).order = i;
     }
     return {
-      childPageIdsAndOrder: children.results
+      childPageIdsAndOrder: children
         .filter((b: any) => b.type === "child_page")
         .map((b: any) => ({ id: b.id, order: b.order })),
-      linksPageIdsAndOrder: children.results
+      linksPageIdsAndOrder: children
         .filter((b: any) => b.type === "link_to_page")
         .map((b: any) => ({ id: b.link_to_page.page_id, order: b.order })),
-      hasParagraphs: children.results.some(
+      hasParagraphs: children.some(
         b =>
           (b as any).type === "paragraph" &&
           (b as any).paragraph.rich_text.length > 0
       ),
     };
   }
-}
-
-async function getPageMetadata(id: string): Promise<GetPageResponse> {
-  await rateLimit();
-
-  return await notionClient.pages.retrieve({
-    page_id: id,
-  });
-}
-
-async function rateLimit() {
-  if (notionLimiter.getTokensRemaining() < 1) {
-    logDebug("", "*** delaying for rate limit");
-  }
-  await notionLimiter.removeTokens(1);
 }

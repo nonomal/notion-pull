@@ -1,12 +1,17 @@
 import * as fs from "fs-extra";
 import FileType, { FileTypeResult } from "file-type";
-import fetch from "node-fetch";
-import * as Path from "path";
+import axios from "axios";
 import { makeImagePersistencePlan } from "./MakeImagePersistencePlan";
 import { warning, logDebug, verbose, info } from "./log";
 import { ListBlockChildrenResponseResult } from "notion-to-md/build/types";
+import {
+  IDocuNotionContext,
+  IDocuNotionContextPageInfo,
+  IPlugin,
+} from "./plugins/pluginTypes";
+import { writeAsset } from "./assets";
 
-// We several things here:
+// We handle several things here:
 // 1) copy images locally instead of leaving them in Notion
 // 2) change the links to point here
 // 3) read the caption and if there are localized images, get those too
@@ -31,8 +36,7 @@ export type ImageSet = {
   localizedUrls: Array<{ iso632Code: string; url: string }>;
 
   // then we fill this in from processImageBlock():
-  pathToParentDocument?: string;
-  relativePathToParentDocument?: string;
+  pageInfo?: IDocuNotionContextPageInfo;
 
   // then we fill these in readPrimaryImage():
   primaryBuffer?: Buffer;
@@ -54,7 +58,6 @@ export async function initImageHandling(
   imagePrefix = prefix.replace(/\/$/, "");
   imageOutputPath = outputPath;
   locales = incomingLocales;
-  console.log("locales:" + JSON.stringify(locales));
 
   // Currently we don't delete the image directory, because if an image
   // changes, it gets a new id. This way can then prevent downloading
@@ -65,20 +68,30 @@ export async function initImageHandling(
   }
 }
 
+export const standardImageTransformer: IPlugin = {
+  name: "DownloadImagesToRepo",
+  notionToMarkdownTransforms: [
+    {
+      type: "image",
+      // we have to set this one up for each page because we need to
+      // give it two extra parameters that are context for each page
+      getStringFromBlock: (
+        context: IDocuNotionContext,
+        block: ListBlockChildrenResponseResult
+      ) => markdownToMDImageTransformer(block, context),
+    },
+  ],
+};
+
 // This is a "custom transformer" function passed to notion-to-markdown
 // eslint-disable-next-line @typescript-eslint/require-await
 export async function markdownToMDImageTransformer(
   block: ListBlockChildrenResponseResult,
-  fullPathToDirectoryContainingMarkdown: string,
-  relativePathToThisPage: string
+  context: IDocuNotionContext
 ): Promise<string> {
   const image = (block as any).image;
 
-  await processImageBlock(
-    image,
-    fullPathToDirectoryContainingMarkdown,
-    relativePathToThisPage
-  );
+  await processImageBlock(block, context);
 
   // just concatenate the caption text parts together
   const altText: string = image.caption
@@ -92,19 +105,26 @@ export async function markdownToMDImageTransformer(
 }
 
 async function processImageBlock(
-  imageBlock: any,
-  pathToParentDocument: string,
-  relativePathToThisPage: string
+  block: any,
+  context: IDocuNotionContext
 ): Promise<void> {
+  const imageBlock = block.image;
   logDebug("processImageBlock", JSON.stringify(imageBlock));
 
-  // this is broken into all these steps to facilitate unit testing without IO
   const imageSet = parseImageBlock(imageBlock);
-  imageSet.pathToParentDocument = pathToParentDocument;
-  imageSet.relativePathToParentDocument = relativePathToThisPage;
+  imageSet.pageInfo = context.pageInfo;
 
+  // enhance: it would much better if we could split the changes to markdown separately from actual reading/writing,
+  // so that this wasn't part of the markdown-creation loop. It's already almost there; we just need to
+  // save the imageSets somewhere and then do the actual reading/writing later.
   await readPrimaryImage(imageSet);
-  makeImagePersistencePlan(imageSet, imageOutputPath, imagePrefix);
+  makeImagePersistencePlan(
+    context.options,
+    imageSet,
+    block.id,
+    imageOutputPath,
+    imagePrefix
+  );
   await saveImage(imageSet);
 
   // change the src to point to our copy of the image
@@ -128,18 +148,23 @@ async function processImageBlock(
 }
 
 async function readPrimaryImage(imageSet: ImageSet) {
-  const response = await fetch(imageSet.primaryUrl);
-  const arrayBuffer = await response.arrayBuffer();
-  imageSet.primaryBuffer = Buffer.from(arrayBuffer);
+  // In Mar 2024, we started having a problem getting a particular gif from imgur using
+  // node-fetch. Switching to axios resolved it. I don't know why.
+  const response = await axios.get(imageSet.primaryUrl, {
+    responseType: "arraybuffer",
+  });
+  imageSet.primaryBuffer = Buffer.from(response.data, "utf-8");
   imageSet.fileType = await FileType.fromBuffer(imageSet.primaryBuffer);
 }
 
 async function saveImage(imageSet: ImageSet): Promise<void> {
-  writeImageIfNew(imageSet.primaryFileOutputPath!, imageSet.primaryBuffer!);
+  const path = imageSet.primaryFileOutputPath!;
+  imageWasSeen(path);
+  writeAsset(path, imageSet.primaryBuffer!);
 
   for (const localizedImage of imageSet.localizedUrls) {
     let buffer = imageSet.primaryBuffer!;
-    // if we have a urls for the localized screenshot, download it
+    // if we have a url for the localized screenshot, download it
     if (localizedImage?.url.length > 0) {
       verbose(`Retrieving ${localizedImage.iso632Code} version...`);
       const response = await fetch(localizedImage.url);
@@ -153,30 +178,17 @@ async function saveImage(imageSet: ImageSet): Promise<void> {
     }
     const directory = `./i18n/${
       localizedImage.iso632Code
-    }/docusaurus-plugin-content-docs/current/${imageSet.relativePathToParentDocument!}`;
+    }/docusaurus-plugin-content-docs/current/${
+      imageSet.pageInfo!.relativeFilePathToFolderContainingPage
+    }`;
 
-    writeImageIfNew(
-      (directory + "/" + imageSet.outputFileName!).replaceAll("//", "/"),
-      buffer
+    const newPath = (directory + "/" + imageSet.outputFileName!).replaceAll(
+      "//",
+      "/"
     );
+    imageWasSeen(newPath);
+    writeAsset(newPath, buffer);
   }
-}
-
-function writeImageIfNew(path: string, buffer: Buffer) {
-  imageWasSeen(path);
-
-  // Note: it's tempting to not spend time writing this out if we already have
-  // it from a previous run. But we don't really know it's the same. A) it
-  // could just have the same name, B) it could have been previously
-  // unlocalized and thus filled with a copy of the primary language image
-  // while and now is localized.
-  if (fs.pathExistsSync(path)) {
-    verbose("Replacing image " + path);
-  } else {
-    verbose("Adding image " + path);
-    fs.mkdirsSync(Path.dirname(path));
-  }
-  fs.createWriteStream(path).write(buffer); // async but we're not waiting
 }
 
 export function parseImageBlock(image: any): ImageSet {
